@@ -49,7 +49,7 @@ DB_PATH = "mgimo_dating_bot.db"
 # username бота в Telegram БЕЗ @
 BOT_USERNAME = "diplomatch_bot"  # например "Diplomatch_bot"
 
-SUBSCRIPTION_PRICE_RUB = "10000.00"
+SUBSCRIPTION_PRICE_RUB = "1490.00"
 SUBSCRIPTION_DESCRIPTION = "DiplomatMatch subscription"
 
 # YooKassa credentials (shop_id + secret_key)
