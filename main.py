@@ -19,7 +19,7 @@ import logging
 import os
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from telegram import (
     Update,
@@ -78,6 +78,8 @@ PROFILE_STEP_AGE = "age"
 PROFILE_STEP_FACULTY = "faculty"
 PROFILE_STEP_CONFIRM = "confirm"
 
+PROFILE_PHOTOS_DONE = "profile_photos_done"
+
 UD_PROFILE_WIZARD = "profile_wizard"
 
 # ---------------------------------------------------------------------------
@@ -126,6 +128,8 @@ class Database:
             CREATE TABLE IF NOT EXISTS profiles (
                 user_id         INTEGER PRIMARY KEY,
                 photo_file_id   TEXT,
+                photo_file_id2  TEXT,
+                photo_file_id3  TEXT,
                 name            TEXT,
                 age             INTEGER,
                 faculty         TEXT,
@@ -136,6 +140,12 @@ class Database:
             )
             """
         )
+
+        for extra_photo_col in ("photo_file_id2", "photo_file_id3"):
+            if not self._column_exists(conn, "profiles", extra_photo_col):
+                c.execute(
+                    f"ALTER TABLE profiles ADD COLUMN {extra_photo_col} TEXT"
+                )
 
         c.execute(
             """
@@ -154,6 +164,13 @@ class Database:
 
         conn.commit()
         conn.close()
+
+    def _column_exists(self, conn: sqlite3.Connection, table: str, column: str) -> bool:
+        cur = conn.execute(f"PRAGMA table_info({table})")
+        for row in cur.fetchall():
+            if row[1] == column:
+                return True
+        return False
 
     def _now(self) -> str:
         return datetime.utcnow().isoformat()
@@ -329,7 +346,7 @@ class Database:
     def upsert_profile(
         self,
         user_id: int,
-        photo_file_id: str,
+        photo_file_ids: List[str],
         name: str,
         age: int,
         faculty: str,
@@ -340,16 +357,20 @@ class Database:
         c = conn.cursor()
         existing = self.get_profile(user_id)
 
+        photos = (photo_file_ids + [None, None, None])[:3]
+
         if existing is None:
             c.execute(
                 """
-                INSERT INTO profiles (user_id, photo_file_id, name, age, faculty,
-                                      is_active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO profiles (user_id, photo_file_id, photo_file_id2, photo_file_id3,
+                                      name, age, faculty, is_active, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
-                    photo_file_id,
+                    photos[0],
+                    photos[1],
+                    photos[2],
                     name,
                     age,
                     faculty,
@@ -362,12 +383,14 @@ class Database:
             c.execute(
                 """
                 UPDATE profiles
-                SET photo_file_id = ?, name = ?, age = ?, faculty = ?,
-                    is_active = ?, updated_at = ?
+                SET photo_file_id = ?, photo_file_id2 = ?, photo_file_id3 = ?,
+                    name = ?, age = ?, faculty = ?, is_active = ?, updated_at = ?
                 WHERE user_id = ?
                 """,
                 (
-                    photo_file_id,
+                    photos[0],
+                    photos[1],
+                    photos[2],
                     name,
                     age,
                     faculty,
@@ -400,7 +423,9 @@ class Database:
         p = self.get_profile(user_id)
         if p is None:
             return False
-        for f in ("photo_file_id", "name", "age", "faculty"):
+        if not profile_photo_ids(p):
+            return False
+        for f in ("name", "age", "faculty"):
             if p[f] is None:
                 return False
         return True
@@ -466,7 +491,11 @@ class Database:
             JOIN users u ON u.user_id = p.user_id
             WHERE p.user_id != ?
               AND p.is_active = 1
-              AND p.photo_file_id IS NOT NULL
+              AND (
+                    p.photo_file_id IS NOT NULL
+                 OR p.photo_file_id2 IS NOT NULL
+                 OR p.photo_file_id3 IS NOT NULL
+              )
               AND p.name IS NOT NULL
               AND p.age IS NOT NULL
               AND p.faculty IS NOT NULL
@@ -496,6 +525,40 @@ class Database:
 
 
 db = Database(DB_PATH)
+
+
+def profile_photo_ids(profile: Optional[sqlite3.Row]) -> List[str]:
+    if not profile:
+        return []
+
+    photos: List[str] = []
+    for key in ("photo_file_id", "photo_file_id2", "photo_file_id3"):
+        try:
+            val = profile[key]
+        except Exception:
+            val = None
+        if val:
+            photos.append(val)
+    return photos
+
+
+async def send_photos_with_caption(
+    bot,
+    chat_id: int,
+    photos: List[str],
+    caption: str,
+    reply_markup: Optional[InlineKeyboardMarkup] = None,
+):
+    if photos and len(photos) > 1:
+        media = [InputMediaPhoto(media=p) for p in photos]
+        await bot.send_media_group(chat_id=chat_id, media=media)
+        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
+    elif photos:
+        await bot.send_photo(
+            chat_id=chat_id, photo=photos[0], caption=caption, reply_markup=reply_markup
+        )
+    else:
+        await bot.send_message(chat_id=chat_id, text=caption, reply_markup=reply_markup)
 
 # ---------------------------------------------------------------------------
 # КЛАВИАТУРЫ
@@ -579,20 +642,20 @@ def browse_profile_keyboard(target_user_id: int) -> InlineKeyboardMarkup:
 
 
 async def safe_edit(
-    q, text: str, kb: Optional[InlineKeyboardMarkup] = None
+    q, text: str, kb: Optional[InlineKeyboardMarkup] = None, **kwargs
 ) -> None:
     """
     Пробуем редактировать текст, если не получилось — подпись,
     если и это не сработало — отправляем новое сообщение.
     """
     try:
-        await q.edit_message_text(text=text, reply_markup=kb)
+        await q.edit_message_text(text=text, reply_markup=kb, **kwargs)
     except Exception:
         try:
-            await q.edit_message_caption(caption=text, reply_markup=kb)
+            await q.edit_message_caption(caption=text, reply_markup=kb, **kwargs)
         except Exception:
             try:
-                await q.message.reply_text(text=text, reply_markup=kb)
+                await q.message.reply_text(text=text, reply_markup=kb, **kwargs)
             except Exception as e:
                 logger.warning("Failed to send message in safe_edit: %s", e)
 
@@ -684,6 +747,7 @@ async def send_profile_view(
             if profile["is_active"]
             else "выключена и не показывается другим"
         )
+        photos = profile_photo_ids(profile)
         text_lines = [
             "Твоя анкета выглядит так:",
             "",
@@ -693,14 +757,13 @@ async def send_profile_view(
             f"Статус: {status}",
         ]
         text = "\n".join(text_lines)
-        photo_file_id = profile["photo_file_id"]
         kb = profile_edit_keyboard(bool(profile["is_active"]))
 
         if from_callback and update.callback_query:
             q = update.callback_query
             await q.answer()
-            await q.message.reply_photo(
-                photo=photo_file_id, caption=text, reply_markup=kb
+            await send_photos_with_caption(
+                context.bot, q.from_user.id, photos, text, kb
             )
             await safe_edit(
                 q,
@@ -709,8 +772,8 @@ async def send_profile_view(
             )
         else:
             assert update.message
-            await update.message.reply_photo(
-                photo=photo_file_id, caption=text, reply_markup=kb
+            await send_photos_with_caption(
+                context.bot, tg_user.id, photos, text, kb
             )
     else:
         msg = (
@@ -744,13 +807,13 @@ async def send_profile_view(
 def start_profile_wizard_state(profile: Optional[sqlite3.Row]) -> Dict[str, Any]:
     state: Dict[str, Any] = {
         "step": PROFILE_STEP_PHOTO,
-        "photo_file_id": None,
+        "photo_file_ids": [],
         "name": None,
         "age": None,
         "faculty": None,
     }
     if profile:
-        state["photo_file_id"] = profile["photo_file_id"]
+        state["photo_file_ids"] = profile_photo_ids(profile)
         state["name"] = profile["name"]
         state["age"] = profile["age"]
         state["faculty"] = profile["faculty"]
@@ -766,13 +829,25 @@ async def start_profile_wizard_from_callback(
     profile = db.get_profile(tg_user.id)
     context.user_data[UD_PROFILE_WIZARD] = start_profile_wizard_state(profile)
 
+    existing_photos_count = len(profile_photo_ids(profile))
+    existing_note = (
+        f"\nСейчас в анкете сохранено {existing_photos_count} фото. "
+        "Можешь оставить их или прислать новые."
+        if existing_photos_count
+        else ""
+    )
+
     text = (
         "Начинаем создание / редактирование анкеты ✨\n\n"
-        "1️⃣ Шаг 1: пришли мне СВОЁ фото (то, что будет на анкете).\n"
+        "1️⃣ Шаг 1: пришли до *трёх* своих фото, которые будут в анкете.\n"
         "Это должно быть обычное фото, где видно тебя.\n\n"
-        "В любой момент можно отменить командой /cancel."
+        "Когда закончишь, нажми «➡️ Дальше». В любой момент можно отменить командой /cancel."
+        f"{existing_note}"
     )
-    await safe_edit(q, text)
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
+    )
+    await safe_edit(q, text, kb, parse_mode="Markdown")
 
 
 async def handle_profile_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -788,12 +863,56 @@ async def handle_profile_photo_message(update: Update, context: ContextTypes.DEF
         )
         return
     photo = update.message.photo[-1]
-    wizard["photo_file_id"] = photo.file_id
-    wizard["step"] = PROFILE_STEP_NAME
+    photos: List[str] = wizard.get("photo_file_ids", [])
+    if len(photos) >= 3:
+        await update.message.reply_text(
+            "Ты уже добавил три фото. Нажми «➡️ Дальше», чтобы перейти к заполнению анкеты."
+        )
+        return
+    photos.append(photo.file_id)
+    wizard["photo_file_ids"] = photos
     context.user_data[UD_PROFILE_WIZARD] = wizard
+    if len(photos) >= 3:
+        wizard["step"] = PROFILE_STEP_NAME
+        await update.message.reply_text(
+            "Отлично, сохранено три фото 💾\n\n"
+            "2️⃣ Теперь напиши, пожалуйста, своё *имя* так, как хочешь видеть его в анкете.",
+            parse_mode="Markdown",
+        )
+        return
+
+    remaining = 3 - len(photos)
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
+    )
     await update.message.reply_text(
         "Отлично, фото сохранено 💾\n\n"
+        f"Можешь добавить ещё {remaining} фото или нажми «➡️ Дальше», чтобы перейти к имени.",
+        reply_markup=kb,
+    )
+
+
+async def handle_profile_photos_done(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    await q.answer()
+    wizard = context.user_data.get(UD_PROFILE_WIZARD)
+    if not wizard or wizard.get("step") != PROFILE_STEP_PHOTO:
+        return
+
+    photos: List[str] = wizard.get("photo_file_ids", [])
+    if not photos:
+        await safe_edit(q, "Сначала пришли хотя бы одно фото.")
+        return
+
+    wizard["step"] = PROFILE_STEP_NAME
+    context.user_data[UD_PROFILE_WIZARD] = wizard
+    await safe_edit(
+        q,
+        "Фото сохранены 💾\n\n"
         "2️⃣ Теперь напиши, пожалуйста, своё *имя* так, как хочешь видеть его в анкете.",
+        reply_markup=None,
         parse_mode="Markdown",
     )
 
@@ -863,7 +982,7 @@ async def send_profile_wizard_summary(
     wizard = context.user_data.get(UD_PROFILE_WIZARD)
     if not wizard:
         return
-    photo_file_id = wizard.get("photo_file_id")
+    photos: List[str] = wizard.get("photo_file_ids", [])
     name = wizard.get("name")
     age = wizard.get("age")
     faculty = wizard.get("faculty")
@@ -888,15 +1007,15 @@ async def send_profile_wizard_summary(
     )
 
     if update.message:
-        if photo_file_id:
-            await update.message.reply_photo(photo=photo_file_id, caption=text, reply_markup=kb)
+        if photos:
+            await update.message.reply_photo(photo=photos[0], caption=text, reply_markup=kb)
         else:
             await update.message.reply_text(text, reply_markup=kb)
     elif update.callback_query:
         q = update.callback_query
         await q.answer()
-        if photo_file_id:
-            await q.message.reply_photo(photo=photo_file_id, caption=text, reply_markup=kb)
+        if photos:
+            await q.message.reply_photo(photo=photos[0], caption=text, reply_markup=kb)
         else:
             await q.message.reply_text(text, reply_markup=kb)
 
@@ -922,12 +1041,12 @@ async def handle_profile_save_or_cancel(
             await safe_edit(q, text, back_to_menu_keyboard())
             return
 
-        photo_file_id = wizard.get("photo_file_id")
+        photo_file_ids: List[str] = wizard.get("photo_file_ids", [])
         name = wizard.get("name")
         age = wizard.get("age")
         faculty = wizard.get("faculty")
 
-        if not all([photo_file_id, name, age, faculty]):
+        if not (photo_file_ids and name and age and faculty):
             text = "Не все данные заполнены. Попробуй снова запустить создание анкеты."
             await safe_edit(q, text, back_to_menu_keyboard())
             return
@@ -937,7 +1056,7 @@ async def handle_profile_save_or_cancel(
 
         db.upsert_profile(
             user_id=tg_user.id,
-            photo_file_id=photo_file_id,
+            photo_file_ids=photo_file_ids,
             name=name,
             age=int(age),
             faculty=faculty,
@@ -1384,20 +1503,21 @@ async def show_next_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"Возраст: {candidate['age']}\n"
         f"Факультет: {candidate['faculty']}"
     )
-    photo_file_id = candidate["photo_file_id"]
+    photos = profile_photo_ids(candidate)
     kb = browse_profile_keyboard(candidate["user_id"])
 
     if update.callback_query:
         q = update.callback_query
         await q.answer()
-        if q.message and q.message.photo:
-            media = InputMediaPhoto(media=photo_file_id, caption=caption)
-            await q.message.edit_media(media=media, reply_markup=kb)
-        else:
-            await safe_edit(q, caption, kb)
+        await send_photos_with_caption(
+            context.bot, q.from_user.id, photos, caption, kb
+        )
+        await safe_edit(q, "Новая анкета отправлена выше 👆", back_to_menu_keyboard())
     else:
         assert update.message
-        await update.message.reply_photo(photo=photo_file_id, caption=caption, reply_markup=kb)
+        await send_photos_with_caption(
+            context.bot, tg_user.id, photos, caption, kb
+        )
 
 
 async def handle_browse_profiles_entry(
@@ -1577,8 +1697,8 @@ async def handle_edit_profile_field(update: Update, context: ContextTypes.DEFAUL
         wizard["step"] = PROFILE_STEP_PHOTO
         text = (
             "Ок, давай обновим фото 📸\n\n"
-            "Пришли новое фото для анкеты. "
-            "В любой момент можно отменить командой /cancel."
+            "Пришли до трёх новых фото для анкеты или нажми «➡️ Дальше», "
+            "если хочешь оставить текущие. В любой момент можно отменить командой /cancel."
         )
     elif data == "edit_profile_name":
         wizard["step"] = PROFILE_STEP_NAME
@@ -1607,7 +1727,12 @@ async def handle_edit_profile_field(update: Update, context: ContextTypes.DEFAUL
         return
 
     context.user_data[UD_PROFILE_WIZARD] = wizard
-    await safe_edit(q, text)
+    kb = None
+    if wizard.get("step") == PROFILE_STEP_PHOTO:
+        kb = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
+        )
+    await safe_edit(q, text, kb, parse_mode="Markdown")
 
 
 # ---------------------------------------------------------------------------
@@ -1638,6 +1763,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     if data == "start_profile_wizard":
         await start_profile_wizard_from_callback(update, context)
+        return
+    if data == PROFILE_PHOTOS_DONE:
+        await handle_profile_photos_done(update, context)
         return
     if data == "subscription":
         await show_subscription_info(update, context)
