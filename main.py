@@ -724,7 +724,8 @@ async def handle_gender_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         "Теперь можно пользоваться ботом. Открываю главное меню 👇"
     )
 
-    await safe_edit(q, text, main_menu_keyboard())
+    await update.message.reply_text(
+    text, main_menu_keyboard())
 
 
 # ---------------------------------------------------------------------------
@@ -916,8 +917,7 @@ async def handle_profile_photos_done(
         parse_mode="Markdown",
     )
 
-
-async def handle_profile_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def  handle_profile_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
         return
@@ -1450,25 +1450,42 @@ async def ensure_can_browse(
         return None
 
     if gender == GENDER_MALE and not is_premium:
-        text = (
-            "Просмотр анкет для парней доступен по *месячной подписке* 💎.\n\n"
-            "Сейчас у тебя подписки *нет* или срок действия уже истёк.\n"
-            "Перейди в раздел «Подписка» и оформи её."
-        )
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("💎 Подписка", callback_data="subscription")],
-                [InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_menu")],
-            ]
-        )
-        if update.callback_query:
-            q = update.callback_query
-            await q.answer()
-            await safe_edit(q, text, kb)
-        else:
-            assert update.message
-            await update.message.reply_text(text, reply_markup=kb)
-        return None
+
+        views = db.get_daily_views(tg_user.id)
+
+        if views >= 3:
+            text = text = """💎 Доступ ограничен
+
+Ты посмотрел 3 анкеты.
+
+Чтобы продолжить — оформи подписку."""
+            kb = InlineKeyboardMarkup(
+
+                [
+
+                    [InlineKeyboardButton("💎 Подписка", callback_data="subscription")],
+
+                    [InlineKeyboardButton("⬅️ В главное меню", callback_data="back_to_menu")],
+
+                ]
+
+            )
+
+            if update.callback_query:
+
+                q = update.callback_query
+
+                await q.answer()
+
+                await safe_edit(q, text, kb)
+
+            else:
+
+                assert update.message
+
+                await update.message.reply_text(text, reply_markup=kb)
+
+            return None
 
     return gender, is_premium
 
@@ -1478,7 +1495,7 @@ async def show_next_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not can:
         return
 
-    gender, _ = can
+    gender, is_premium = can
     tg_user = update.effective_user
     if not tg_user:
         return
@@ -1519,6 +1536,9 @@ async def show_next_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             context.bot, tg_user.id, photos, caption, kb
         )
 
+
+    if gender == GENDER_MALE and not is_premium:
+        db.inc_daily_views(tg_user.id)
 
 async def handle_browse_profiles_entry(
     update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -1866,3 +1886,56 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+    def get_daily_views(self, user_id: int) -> int:
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute(
+            "SELECT COALESCE(daily_views, 0) FROM users WHERE user_id = ?",
+            (user_id,)
+        )
+        row = c.fetchone()
+        conn.close()
+        return int(row[0]) if row and row[0] is not None else 0
+
+    def inc_daily_views(self, user_id: int) -> None:
+        conn = self._connect()
+        c = conn.cursor()
+        c.execute(
+            "UPDATE users SET daily_views = COALESCE(daily_views, 0) + 1, updated_at = ? WHERE user_id = ?",
+            (self._now(), user_id)
+        )
+        conn.commit()
+        conn.close()
+
+
+
+# ================== RUNTIME DAILY VIEWS PATCH ==================
+# НЕ УДАЛЯТЬ. Гарантирует наличие методов у Database во всех местах.
+__RUNTIME_DAILY_VIEWS_PATCH__ = True
+
+def _db_get_daily_views(self, user_id: int) -> int:
+    conn = self._connect()
+    c = conn.cursor()
+    try:
+        c.execute("SELECT COALESCE(daily_views, 0) FROM users WHERE user_id = ?", (user_id,))
+        row = c.fetchone()
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
+
+def _db_inc_daily_views(self, user_id: int, delta: int = 1) -> None:
+    conn = self._connect()
+    c = conn.cursor()
+    try:
+        c.execute(
+            "UPDATE users SET daily_views = COALESCE(daily_views, 0) + ? WHERE user_id = ?",
+            (delta, user_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+# принудительно навешиваем методы на Database
+Database.get_daily_views = _db_get_daily_views
+Database.inc_daily_views = _db_inc_daily_views
+# ================== END PATCH ==================
