@@ -865,75 +865,56 @@ async def handle_profile_photo_message(update: Update, context: ContextTypes.DEF
         return
     photo = update.message.photo[-1]
     photos: List[str] = wizard.get("photo_file_ids", [])
-# if len(photos) >= 3:
-#     keyboard = [
-#         [KeyboardButton("➡️ Дальше")]
-#     ]
-#     reply_markup = ReplyKeyboardMarkup(
-#         keyboard,
-#         resize_keyboard=True,
-#         one_time_keyboard=True
-#     )
-# 
-#     update.message.reply_text(
-#         "Ты уже добавил три фото. Нажми «➡️ Дальше», чтобы перейти к заполнению анкеты.",
-#         reply_markup=reply_markup
-#     )
-    
+    if len(photos) >= 3:
+        await update.message.reply_text(
+            "Ты уже добавил три фото. Нажми «➡️ Дальше», чтобы перейти к заполнению анкеты."
+        )
+        return
     photos.append(photo.file_id)
     wizard["photo_file_ids"] = photos
     context.user_data[UD_PROFILE_WIZARD] = wizard
     if len(photos) >= 3:
         wizard["step"] = PROFILE_STEP_NAME
-        update.message.reply_text(
+        await update.message.reply_text(
             "Отлично, сохранено три фото 💾\n\n"
             "2️⃣ Теперь напиши, пожалуйста, своё *имя* так, как хочешь видеть его в анкете.",
-#             parse_mode="Markdown",
-)
-# 
-#     remaining = 3 - len(photos)
-
-# === FIXED PHOTO FLOW (1–3 photos) ===
-photos = wizard.get("photo_file_ids", [])
-remaining = 3 - len(photos)
-
-if remaining <= 0:
-    wizard["step"] = "name"
-    await update.effective_message.reply_text(
-        "Фото сохранены 🖼\n\nТеперь напиши своё имя так, как хочешь видеть его в анкете."
-    )
-    return
-
-kb = InlineKeyboardMarkup([
-    [InlineKeyboardButton("➡️ Дальше", callback_data="PROFILE_PHOTOS_DONE")]
-])
-
-await update.effective_message.reply_text(
-    f"Фото сохранено 📸\nМожно добавить ещё {remaining} фото или нажми «➡️ Дальше».",
-    reply_markup=kb
-)
-
-#     kb = InlineKeyboardMarkup(
-#         [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
-#     )
-#     update.message.reply_text(
-#         "Отлично, фото сохранено 💾\n\n"
-#         f"Можешь добавить ещё {remaining} фото или нажми «➡️ Дальше», чтобы перейти к имени.",
-#         reply_markup=kb,
-# 
-# 
-# async def handle_profile_photos_done(update, context):
-    q = getattr(update, 'callback_query', None)
-    if q:
-        await q.answer()
-    wizard = context.user_data.get('wizard')
-    if not wizard:
+            parse_mode="Markdown",
+        )
         return
-    wizard['step'] = 'name'
-    await update.effective_message.reply_text(
-        "Фото сохранены 🖼
 
-Теперь напиши своё имя так, как хочешь видеть его в анкете."
+    remaining = 3 - len(photos)
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
+    )
+    await update.message.reply_text(
+        "Отлично, фото сохранено 💾\n\n"
+        f"Можешь добавить ещё {remaining} фото или нажми «➡️ Дальше», чтобы перейти к имени.",
+        reply_markup=kb,
+    )
+
+
+async def handle_profile_photos_done(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    q = update.callback_query
+    await q.answer()
+    wizard = context.user_data.get(UD_PROFILE_WIZARD)
+    if not wizard or wizard.get("step") != PROFILE_STEP_PHOTO:
+        return
+
+    photos: List[str] = wizard.get("photo_file_ids", [])
+    if not photos:
+        await safe_edit(q, "Сначала пришли хотя бы одно фото.")
+        return
+
+    wizard["step"] = PROFILE_STEP_NAME
+    context.user_data[UD_PROFILE_WIZARD] = wizard
+    await safe_edit(
+        q,
+        "Фото сохранены 💾\n\n"
+        "2️⃣ Теперь напиши, пожалуйста, своё *имя* так, как хочешь видеть его в анкете.",
+        reply_markup=None,
+        parse_mode="Markdown",
     )
 
 async def  handle_profile_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1548,9 +1529,6 @@ async def show_next_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await send_photos_with_caption(
             context.bot, q.from_user.id, photos, caption, kb
         )
-
-    if gender == GENDER_MALE and not is_premium:
-        db.inc_daily_views(tg_user.id)
         await safe_edit(q, "Новая анкета отправлена выше 👆", back_to_menu_keyboard())
     else:
         assert update.message
