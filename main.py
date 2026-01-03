@@ -80,6 +80,9 @@ PROFILE_STEP_CONFIRM = "confirm"
 
 PROFILE_PHOTOS_DONE = "profile_photos_done"
 
+
+PHOTO_SLOT_PREFIX = "photo_slot_"
+UD_PHOTO_SLOT = "photo_slot"
 UD_PROFILE_WIZARD = "profile_wizard"
 
 # ---------------------------------------------------------------------------
@@ -565,6 +568,26 @@ async def send_photos_with_caption(
 # ---------------------------------------------------------------------------
 
 
+
+
+def _normalize_photos_list(photos):
+    if not isinstance(photos, list):
+        photos = []
+    return (photos + [None, None, None])[:3]
+
+def photos_step_keyboard(wizard):
+    photos = _normalize_photos_list(wizard.get("photo_file_ids", []))
+    marks = ["✅" if photos[i] else "➕" for i in range(3)]
+    kb = [
+        [
+            InlineKeyboardButton(f"{marks[0]} Фото 1", callback_data=f"{PHOTO_SLOT_PREFIX}1"),
+            InlineKeyboardButton(f"{marks[1]} Фото 2", callback_data=f"{PHOTO_SLOT_PREFIX}2"),
+            InlineKeyboardButton(f"{marks[2]} Фото 3", callback_data=f"{PHOTO_SLOT_PREFIX}3"),
+        ],
+        [InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)],
+    ]
+    return InlineKeyboardMarkup(kb)
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("👤 Моя анкета", callback_data="view_profile")],
@@ -821,99 +844,103 @@ def start_profile_wizard_state(profile: Optional[sqlite3.Row]) -> Dict[str, Any]
     return state
 
 
-async def start_profile_wizard_from_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def start_profile_wizard_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
+
     tg_user = q.from_user
     profile = db.get_profile(tg_user.id)
-    context.user_data[UD_PROFILE_WIZARD] = start_profile_wizard_state(profile)
 
-    existing_photos_count = len(profile_photo_ids(profile))
-    existing_note = (
-        f"\nСейчас в анкете сохранено {existing_photos_count} фото. "
-        "Можешь оставить их или прислать новые."
-        if existing_photos_count
-        else ""
-    )
+    wizard = start_profile_wizard_state(profile)
+    context.user_data[UD_PROFILE_WIZARD] = wizard
 
     text = (
-        "Начинаем создание / редактирование анкеты ✨\n\n"
-        "1️⃣ Шаг 1: пришли до *трёх* своих фото, которые будут в анкете.\n"
-        "Это должно быть обычное фото, где видно тебя.\n\n"
-        "Когда закончишь, нажми «➡️ Дальше». В любой момент можно отменить командой /cancel."
-        f"{existing_note}"
+        "📸 *Фото анкеты*\n\n"
+        "Выбери слот (Фото 1/2/3) и пришли фото.\n"
+        "Можно оставить 1–3 фото.\n\n"
+        "Когда закончишь — жми «➡️ Дальше»."
     )
-    kb = InlineKeyboardMarkup(
+
+    kb = photos_step_keyboard(wizard) if "photos_step_keyboard" in globals() else InlineKeyboardMarkup(
         [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
     )
-    await safe_edit(q, text, kb, parse_mode="Markdown")
+
+    try:
+        await safe_edit(q, text, kb, parse_mode="Markdown")
+    except Exception:
+        await q.message.reply_text(text, reply_markup=kb, parse_mode="Markdown")
 
 
 async def handle_profile_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tg_user = update.effective_user
     if not tg_user:
         return
+
     wizard = context.user_data.get(UD_PROFILE_WIZARD)
     if not wizard or wizard.get("step") != PROFILE_STEP_PHOTO:
         return
+
     if not update.message or not update.message.photo:
-        await update.message.reply_text(
-            "Я жду фото для анкеты 🙂 Отправь, пожалуйста, именно фотографию."
-        )
+        await update.message.reply_text("Я жду фото для анкеты. Отправь, пожалуйста, именно фотографию.")
         return
+
     photo = update.message.photo[-1]
-    photos: List[str] = wizard.get("photo_file_ids", [])
-    if len(photos) >= 3:
-        await update.message.reply_text(
-            "Ты уже добавил три фото. Нажми «➡️ Дальше», чтобы перейти к заполнению анкеты."
-        )
-        return
-    photos.append(photo.file_id)
+    photos = _normalize_photos_list(wizard.get("photo_file_ids", []))
+
+    slot_idx = context.user_data.get(UD_PHOTO_SLOT, None)
+    if slot_idx in (0, 1, 2):
+        photos[slot_idx] = photo.file_id
+        context.user_data.pop(UD_PHOTO_SLOT, None)
+    else:
+        # положим в первый пустой слот
+        try:
+            empty_idx = photos.index(None)
+            photos[empty_idx] = photo.file_id
+        except ValueError:
+            # все заняты — по умолчанию заменим первое фото
+            photos[0] = photo.file_id
+
     wizard["photo_file_ids"] = photos
     context.user_data[UD_PROFILE_WIZARD] = wizard
-    if len(photos) >= 3:
+
+    filled = sum(1 for x in photos if x)
+    if filled >= 3:
         wizard["step"] = PROFILE_STEP_NAME
         await update.message.reply_text(
-            "Отлично, сохранено три фото 💾\n\n"
+            "Отлично, сохранено три фото ✅\n\n"
             "2️⃣ Теперь напиши, пожалуйста, своё *имя* так, как хочешь видеть его в анкете.",
             parse_mode="Markdown",
         )
         return
 
-    remaining = 3 - len(photos)
-    kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
-    )
     await update.message.reply_text(
-        "Отлично, фото сохранено 💾\n\n"
-        f"Можешь добавить ещё {remaining} фото или нажми «➡️ Дальше», чтобы перейти к имени.",
-        reply_markup=kb,
+        "Фото сохранено ✅\n\n"
+        "Выбери слот (Фото 1/2/3) чтобы заменить, или просто отправь следующее фото.\n"
+        "Когда закончишь — жми «➡️ Дальше».",
+        reply_markup=photos_step_keyboard(wizard),
     )
 
 
-async def handle_profile_photos_done(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
+async def handle_profile_photos_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
     await q.answer()
+
     wizard = context.user_data.get(UD_PROFILE_WIZARD)
     if not wizard or wizard.get("step") != PROFILE_STEP_PHOTO:
         return
 
-    photos: List[str] = wizard.get("photo_file_ids", [])
-    if not photos:
-        await safe_edit(q, "Сначала пришли хотя бы одно фото.")
-        return
+    # Разрешаем 0/1/2/3 фото — просто переходим дальше
+    photo_ids = wizard.get("photo_file_ids", [])
+    if not isinstance(photo_ids, list):
+        photo_ids = []
+    if len(photo_ids) > 3:
+        wizard["photo_file_ids"] = photo_ids[:3]
 
     wizard["step"] = PROFILE_STEP_NAME
-    context.user_data[UD_PROFILE_WIZARD] = wizard
     await safe_edit(
         q,
-        "Фото сохранены 💾\n\n"
         "2️⃣ Теперь напиши, пожалуйста, своё *имя* так, как хочешь видеть его в анкете.",
-        reply_markup=None,
+        None,
         parse_mode="Markdown",
     )
 
@@ -1749,9 +1776,7 @@ async def handle_edit_profile_field(update: Update, context: ContextTypes.DEFAUL
     context.user_data[UD_PROFILE_WIZARD] = wizard
     kb = None
     if wizard.get("step") == PROFILE_STEP_PHOTO:
-        kb = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("➡️ Дальше", callback_data=PROFILE_PHOTOS_DONE)]]
-        )
+        kb = photos_step_keyboard(wizard)
     await safe_edit(q, text, kb, parse_mode="Markdown")
 
 
@@ -1760,10 +1785,42 @@ async def handle_edit_profile_field(update: Update, context: ContextTypes.DEFAUL
 # ---------------------------------------------------------------------------
 
 
+
+async def handle_photo_slot_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    data = q.data  # photo_slot_1/2/3
+    wizard = context.user_data.get(UD_PROFILE_WIZARD)
+    if not wizard or wizard.get("step") != PROFILE_STEP_PHOTO:
+        return
+
+    try:
+        slot_num = int(data.replace(PHOTO_SLOT_PREFIX, ""))
+        slot_idx = slot_num - 1
+        if slot_idx not in (0, 1, 2):
+            return
+    except Exception:
+        return
+
+    context.user_data[UD_PHOTO_SLOT] = slot_idx
+    await safe_edit(
+        q,
+        f"Ок! Пришли фото для *слота {slot_num}*.\n\n"
+        "Можно выбрать другой слот кнопками ниже.",
+        photos_step_keyboard(wizard),
+        parse_mode="Markdown",
+    )
+
+
 async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    await q.answer()
     data = q.data
 
+
+    # Создание/редактирование анкеты
+    if data in ("start_profile_wizard", "edit_profile"):
+        await start_profile_wizard_from_callback(update, context)
+        return
     if data == "back_to_menu":
         await send_main_menu(update, context)
         return
@@ -1784,6 +1841,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "start_profile_wizard":
         await start_profile_wizard_from_callback(update, context)
         return
+
+    if data.startswith(PHOTO_SLOT_PREFIX):
+        wizard = context.user_data.get(UD_PROFILE_WIZARD)
+        if wizard and wizard.get("step") == PROFILE_STEP_PHOTO:
+            await handle_photo_slot_pick(update, context)
+            return
     if data == PROFILE_PHOTOS_DONE:
         await handle_profile_photos_done(update, context)
         return
